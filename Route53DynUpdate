@@ -1,0 +1,31 @@
+#!/sbin/runscript
+
+depend() {
+	need net
+}
+
+checkconfig() {
+    # Verify that the configuration file exists
+    if [ ! -f /etc/network/Route53DynUpdate.ini ]; then
+        eerror "Route53DynUpdate Configuration file /etc/network/Route53DynUpdate.ini doesn't exist"
+        return 1
+    fi
+}
+
+start() {
+	checkconfig || return 1
+	ebegin "Starting Route53DynUpdate"
+    /opt/bin/Route53DynUpdate.py
+	eend $?
+}
+
+stop() {
+	ebegin "Stopping Route53DynUpdate"
+    kill $(cat /run/Route53DynUpdate.pid)
+	eend $?
+}
+
+restart() {
+	stop
+	start
+}
