@@ -104,8 +104,17 @@ class Command(object):
             raise NotImplementedError()
 
     def readConfig(self):
+        if self.args.file is None:
+            print "Configuration file is not provided"
+            exit(1)
         self.config = Config(self.args.file)
         self.config.read()
+        if self.config.AWSAccessKeyId is None:
+            print "AWSAccessKeyId is not set in the configuration file"
+            exit(1)
+        if self.config.AWSSecretAccessKey is None:
+            print "AWSSecretAccessKey is not set in the configuration file"
+            exit(1)
 
     def connectRoute53(self):
         self.r53 = route53.connect(

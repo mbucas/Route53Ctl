@@ -259,6 +259,12 @@ class Daemon(object):
         if self.timestampConfigFile < statConfigFile.st_mtime:
             self.config = Config(self.configFile)
             self.config.read()
+            if self.config.AWSAccessKeyId is None:
+                print "AWSAccessKeyId is not set in the configuration file"
+                exit(1)
+            if self.config.AWSSecretAccessKey is None:
+                print "AWSSecretAccessKey is not set in the configuration file"
+                exit(1)
             self.timestampConfigFile = statConfigFile.st_mtime
 
     def initLog(self):
