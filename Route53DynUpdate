@@ -1,4 +1,4 @@
-#!/sbin/runscript
+#!/sbin/openrc-run
 
 depend() {
 	need net
@@ -20,8 +20,16 @@ start() {
 }
 
 stop() {
-	ebegin "Stopping Route53DynUpdate"
-    kill $(cat /run/Route53DynUpdate.pid)
+    PID=$(cat "/run/Route53DynUpdate.pid" 2>/dev/null)
+    if [ -z "${PID}" ]; then
+        einfo "Route53DynUpdate not running (no pid file)"
+        return 0
+    fi
+
+    ebegin "Stopping Route53DynUpdate"
+    if ! kill $PID > /dev/null 2>&1; then
+        einfo "Could not send SIGTERM to process $PID" >&2
+    fi
 	eend $?
 }
 
