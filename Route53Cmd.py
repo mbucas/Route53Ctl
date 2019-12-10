@@ -44,14 +44,14 @@ Copyright transferred to Free Software Foundation, Inc.
 
 import os
 import argparse
-from ConfigParser import ConfigParser
+from configparser import ConfigParser
 
-import route53
-from route53 import resource_record_set
+import boto3
 
 
 defaults = {
-    'ConfigFile': '~/.Route53Cmd.ini',
+    'ConfigFile': '/etc/network/Route53DynUpdate.ini',
+#    'ConfigFile': '~/.Route53Cmd.ini',
     }
 
 
@@ -100,120 +100,151 @@ class Command(object):
             self.do_add()
         elif self.args.action == 'delete':
             self.do_delete()
+        elif self.args.action == 'listzones':
+            self.do_listzones()
         else:
             raise NotImplementedError()
 
     def readConfig(self):
         if self.args.file is None:
-            print "Configuration file is not provided"
+            print("Configuration file is not provided")
             exit(1)
         self.config = Config(self.args.file)
         self.config.read()
         if self.config.AWSAccessKeyId is None:
-            print "AWSAccessKeyId is not set in the configuration file"
+            print("AWSAccessKeyId is not set in the configuration file")
             exit(1)
         if self.config.AWSSecretAccessKey is None:
-            print "AWSSecretAccessKey is not set in the configuration file"
+            print("AWSSecretAccessKey is not set in the configuration file")
             exit(1)
 
     def connectRoute53(self):
-        self.r53 = route53.connect(
+        self.route53 = boto3.client(
+            'route53',
             aws_access_key_id=self.config.AWSAccessKeyId,
             aws_secret_access_key=self.config.AWSSecretAccessKey
-            )
+        )
 
+    def getHostedZones(self):
+        self.hostedZonesInfo = self.route53.list_hosted_zones()
+        
     def getRecordSets(self):
         """ Get record sets from Amazon
             We retrieve all record sets whatever their type
         """
-        self.connectRoute53()
         r53RecordSets = []
-        for zone in self.r53.list_hosted_zones():
-            for record_set in zone.record_sets:
-                record_set.record_type = record_set.__class__.__name__.replace('ResourceRecordSet', '')
-                r53RecordSets.append(record_set)
+        self.getHostedZones()
+        for zone in self.hostedZonesInfo['HostedZones']:
+            moreRecordSets = True
+            StartRecordName = ''
+            StartRecordType = ''
+            while moreRecordSets:
+                if StartRecordName == '':
+                    self.recordSsetsInfo = self.route53.list_resource_record_sets(
+                        HostedZoneId=zone['Id']
+                    )
+                else:
+                    self.recordSsetsInfo = self.route53.list_resource_record_sets(
+                        HostedZoneId=zone['Id'],
+                        StartRecordName=StartRecordName,
+                        StartRecordType=StartRecordType
+                    )
+                for record_set in self.recordSsetsInfo['ResourceRecordSets']:
+                    r53RecordSets.append(record_set)
+                moreRecordSets = self.recordSsetsInfo['IsTruncated']
+                if moreRecordSets:
+                    StartRecordName = self.recordSsetsInfo['NextRecordName']
+                    StartRecordType = self.recordSsetsInfo['NextRecordType']
         return r53RecordSets
 
     def do_list(self):
+        self.connectRoute53()
         rs = self.getRecordSets()
         for record in rs:
-            ttl = str(record.ttl) if record.ttl else ''
-            ext = ','.join(record.records) if record.records else ''
+            if 'TTL' in record:
+                ttl = str(record['TTL'])
+            else:
+                ttl= ''
+            if 'ResourceRecords' in record:
+                extList = []
+                for rec in record['ResourceRecords']:
+                    extList.append(rec['Value'])
+                ext = ','.join(extList)
+            elif 'AliasTarget' in record:
+                ext = 'AliasTarget=' + record['AliasTarget']['DNSName']
+            else:
+                ext = ''
             # name, ttl, class, type, data
             # http://www.zytrax.com/books/dns/ch8/
             recordstr = (
-                record.name + (' ' * (40 - len(record.name)))
+                record['Name'] + (' ' * (40 - len(record['Name'])))
                 + ' ' + ttl + (' ' * (6 - len(ttl)))
-                + ' IN ' + record.record_type + (' ' * (6 - len(record.record_type))) + ' '
+                + ' IN ' + record['Type'] + (' ' * (6 - len(record['Type']))) + ' '
                 + ext
                 )
-            print recordstr
+            print(recordstr)
 
-    def do_add(self):
+    def do_change(self, action):
         if not self.args.name:
             raise Exception('Missing parameter : host name')
         if not self.args.recordtype:
             raise Exception('Missing parameter : record type')
 
         self.connectRoute53()
-        zones = self.r53.list_hosted_zones()
+        self.getHostedZones()
         # TODO Possibility to use another zone than the first one
-        targetZone = next(zones)
-        new_record = None
+        targetZone = self.hostedZonesInfo['HostedZones'][0]['Id']
+        
+        resourceValue = ''
         if self.args.recordtype == 'A':
             if not self.args.ip:
                 raise Exception('Missing parameter : IPv4 address')
             # TODO : Check IPv4 format
-            new_record, change_info = targetZone.create_a_record(
-                name=self.args.name,
-                values=[self.args.ip],
-                ttl=300
-                )
+            resourceValue = self.args.ip
         elif self.args.recordtype == 'AAAA':
             if not self.args.ip:
                 raise Exception('Missing parameter : IPv6 address')
             # TODO : Check IPv6 format
-            new_record, change_info = targetZone.create_aaaa_record(
-                name=self.args.name,
-                values=[self.args.ip],
-                ttl=300
-                )
+            resourceValue = self.args.ip
         elif self.args.recordtype == 'CNAME':
             if not self.args.cname:
                 raise Exception('Missing parameter : canonical name')
-            new_record, change_info = targetZone.create_cname_record(
-                name=self.args.name,
-                values=[self.args.cname],
-                ttl=300
-                )
+            resourceValue = self.args.cname
         else:
             raise NotImplementedError()
 
-        if new_record:
-            new_record.save()
+        changes = {
+            'Action': action,
+            'ResourceRecordSet': {
+                'Name': self.args.name,
+                'Type': self.args.recordtype,
+                'TTL': 300,
+                'ResourceRecords' : [{'Value': resourceValue}],
+            }
+        }
+        self.route53.change_resource_record_sets(
+            HostedZoneId=targetZone,
+            ChangeBatch={'Changes': [changes]}
+        )
+
+    def do_add(self):
+        self.do_change('CREATE')
 
     def do_delete(self):
-        if not self.args.name:
-            raise Exception('Missing parameter : host name')
-        if not self.args.recordtype:
-            raise Exception('Missing parameter : record type')
+        self.do_change('DELETE')
 
-        rs = self.getRecordSets()
-        deleted = 0
-        for record in rs:
-            if record.name == self.args.name and record.record_type == self.args.recordtype:
-                record.delete()
-                deleted += 1
-
-        if deleted == 0:
-            raise Exception('Failed to find ' + self.args.name)
+    def do_listzones(self):
+        self.connectRoute53()
+        self.getHostedZones()
+        for zone in self.hostedZonesInfo['HostedZones']:
+            print(zone)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-f', '--file', help='configuration file', default=defaults['ConfigFile'])
     # TODO 'modify'
-    parser.add_argument('-a', '--action', help='action', choices=['list', 'add', 'delete', ], required=True)
+    parser.add_argument('-a', '--action', help='action', choices=['list', 'add', 'delete', 'listzones', ], required=True)
     # TODO Other types
     parser.add_argument('-r', '--recordtype', help='record type', choices=['A', 'AAAA', 'CNAME', ])
     parser.add_argument('-n', '--name', help='host name')

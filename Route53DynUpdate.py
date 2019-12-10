@@ -45,11 +45,10 @@ Parameters in hostname section :
 They have the  same function as above, they override the General section.
 
 TODO :
- - Handle CNAME DNS entries and aliases
+ - Handle other DNS entries
  - Check the type of the record set
  - Handle more errors
  - Use different AWS credentials for hosts if configured
- - Publish on GitHub
 
 Limits
  - A connection to Route53 is probably not permanent, so we make a new
@@ -88,9 +87,9 @@ import syslog
 import argparse
 from time import sleep
 from datetime import datetime
-from ConfigParser import ConfigParser
+from configparser import ConfigParser
 
-import route53
+import boto3
 
 # #######################
 # Force IPv4 in urllib
@@ -130,7 +129,7 @@ class Log(object):
         elif self.logType == 'Syslog':
             syslog.openlog(logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
         else:
-            print "Invalid LogType : " + logType
+            print("Invalid LogType : " + logType)
             os._exit(1)
 
     def log(self, message):
@@ -144,10 +143,10 @@ class Log(object):
 
     def close(self):
         if self.logType == 'File':
+            # As we catch signals, there may be concurrency between parts of the
+            # daemon. To make it clear the file is closed, assign None to it
             if self.file:
                 self.file.close()
-                # As we catch signals, there may be concurrency between parts of the daemon
-                # To make it clear the file is closed, assign None to it
                 self.file = None
         elif self.logType == 'Syslog':
             syslog.closelog()
@@ -165,8 +164,9 @@ class Config():
     """
 
     configAttributes = [
-        'AWSAccessKeyId', 'AWSSecretAccessKey', 'Delay', 'LogType', 'LogDestination', 'PIDFile',
-        'PublicIPSource', 'UseDNS', 'RunAsDaemon',
+        'AWSAccessKeyId', 'AWSSecretAccessKey', 'Delay', 'LogType',
+        'LogDestination', 'PIDFile', 'PublicIPSource', 'UseDNS',
+        'RunAsDaemon',
         ]
     hostAttributes = ['AWSAccessKeyId', 'AWSSecretAccessKey', 'UseDNS', ]
 
@@ -223,7 +223,7 @@ class Daemon(object):
         if self.config.RunAsDaemon == 'True':
             self.createDaemon()
         self.initLog()
-        self.getAmazonIP()
+        self.getRoute53IP()
         # Install signal handlers
         signal.signal(signal.SIGTERM, self.sigTERMhandler)
         signal.signal(signal.SIGINT, self.sigTERMhandler)
@@ -249,8 +249,8 @@ class Daemon(object):
             fd = os.open(self.configFile, os.O_RDONLY)
             statConfigFile = os.fstat(fd)
             os.close(fd)
-        except OSError, e:
-            print 'Configuration file not found ' + self.configFile + ' : ' + e.strerror
+        except OSError as e:
+            print('Configuration file not found ' + self.configFile + ' : ' + e.strerror)
             os._exit(1)
 
         if firstTime:
@@ -260,10 +260,10 @@ class Daemon(object):
             self.config = Config(self.configFile)
             self.config.read()
             if self.config.AWSAccessKeyId is None:
-                print "AWSAccessKeyId is not set in the configuration file"
+                print("AWSAccessKeyId is not set in the configuration file")
                 exit(1)
             if self.config.AWSSecretAccessKey is None:
-                print "AWSSecretAccessKey is not set in the configuration file"
+                print("AWSSecretAccessKey is not set in the configuration file")
                 exit(1)
             self.timestampConfigFile = statConfigFile.st_mtime
 
@@ -275,47 +275,76 @@ class Daemon(object):
         self.log = Log(self.config.LogType, self.config.LogDestination)
         self.log.log('Starting with PID='+pid)
 
-    def getRecordSets(self):
-        """ Get record sets from Amazon
-            We retrieve all record sets whatever their type
-        """
-        r53 = route53.connect(
+    def connectRoute53(self):
+        self.route53 = boto3.client(
+            'route53',
             aws_access_key_id=self.config.AWSAccessKeyId,
             aws_secret_access_key=self.config.AWSSecretAccessKey
-            )
+        )
+
+    def getHostedZones(self):
+        self.hostedZonesInfo = self.route53.list_hosted_zones()
+        
+    def getRecordSets(self):
+        """ Get record sets from Route53
+            We retrieve all record sets whatever their type
+        """
         r53RecordSets = []
-        for zone in r53.list_hosted_zones():
-            for record_set in zone.record_sets:
-                r53RecordSets.append(record_set)
+        self.getHostedZones()
+        for zone in self.hostedZonesInfo['HostedZones']:
+            moreRecordSets = True
+            StartRecordName = ''
+            StartRecordType = ''
+            while moreRecordSets:
+                if StartRecordName == '':
+                    self.recordSsetsInfo = self.route53.list_resource_record_sets(
+                        HostedZoneId=zone['Id']
+                    )
+                else:
+                    self.recordSsetsInfo = self.route53.list_resource_record_sets(
+                        HostedZoneId=zone['Id'],
+                        StartRecordName=StartRecordName,
+                        StartRecordType=StartRecordType
+                    )
+                for record_set in self.recordSsetsInfo['ResourceRecordSets']:
+                    r53RecordSets.append(record_set)
+                moreRecordSets = self.recordSsetsInfo['IsTruncated']
+                if moreRecordSets:
+                    StartRecordName = self.recordSsetsInfo['NextRecordName']
+                    StartRecordType = self.recordSsetsInfo['NextRecordType']
         return r53RecordSets
 
-    def getAmazonIP(self):
-        """ Get the IPv4 address from Amazon
+    def getRoute53IP(self):
+        """ Get the IPv4 address from Route53
 
             There at least two ways to get IP addresses
              - DNS query : does not work if addresses are overridden locally
              - Route53 API call
         """
-        r53RecordSets = self.getRecordSets()
-
+        self.connectRoute53()
+        rs = self.getRecordSets()
         for host in self.config.hosts:
             if self.config.hosts[host]['UseDNS'] == 'True':
                 self.hosts[host] = {'IP': socket.gethostbyname(host)}
                 self.log.log(host + ' IP is ' + self.hosts[host]['IP'])
             else:
                 r53Host = None
-
-                # TODO : Check the type of the record set
-                for r53RecordSet in r53RecordSets:
-                    if r53RecordSet.name == host or r53RecordSet.name == host + '.':
-                        r53Host = r53RecordSet
-                        break
+                for record in rs:
+                    if record['Name'] == host or record['Name'] == host + '.':
+                        r53Host = record
 
                 if r53Host:
-                    self.hosts[host] = {'IP': r53Host.records[0]}
+                    if r53Host['Type'] != 'A':
+                        self.log.log("ResourceRecord for host " + host + " isn't an A record. Type found : " + r53Host['Type'])
+                        exit(1)
+                    if len(r53Host['ResourceRecords']) > 1:
+                        self.log.log("Host " + host + " has more than one IP address in Route 53")
+                        exit(1)
+                    self.hosts[host] = {'IP': r53Host['ResourceRecords'][0]['Value']}
                     self.log.log(host + ' IP is ' + self.hosts[host]['IP'])
                 else:
-                    self.log.log('Failed to find ' + host)
+                    self.log.log("Failed to find " + host + " in Route53")
+                    exit(1)
 
     def sigTERMhandler(self, signum, frame):
         self.log.log("Caught signal %d" % signum)
@@ -342,25 +371,28 @@ class Daemon(object):
     def updateIP(self, publicIP):
         """ Call Route53 API to update a record
         """
-        r53RecordSets = self.getRecordSets()
-
+        self.connectRoute53()
+        self.getHostedZones()
+        # TODO Possibility to use another zone than the first one
+        targetZone = self.hostedZonesInfo['HostedZones'][0]['Id']
+        
         for host in self.config.hosts:
-            r53Host = None
 
-            # TODO : Check the type of the record set
-            for r53RecordSet in r53RecordSets:
-                if r53RecordSet.name == host or r53RecordSet.name == host + '.':
-                    r53Host = r53RecordSet
-                    break
-
-            if r53Host:
-                r53Host.records = [publicIP]
-                r53Host.save()  # Does the actual call to the API
-
-                self.log.log(host + ' New IP is ' + publicIP)
-                self.hosts[host]['IP'] = publicIP
-            else:
-                self.log.log('Failed to find ' + host)
+            changes = {
+                'Action': 'UPSERT',
+                'ResourceRecordSet': {
+                    'Name': host,
+                    'Type': 'A',
+                    'TTL': 300,
+                    'ResourceRecords' : [{'Value': publicIP}],
+                }
+            }
+            self.route53.change_resource_record_sets(
+                HostedZoneId=targetZone,
+                ChangeBatch={'Changes': [changes]}
+            )
+            self.log.log(host + ' New IP is ' + publicIP)
+            self.hosts[host]['IP'] = publicIP
 
     def createDaemon(self):
         """ Detach a process from the controlling terminal and run it in the
@@ -372,14 +404,14 @@ class Daemon(object):
 
         try:
             pid = os.fork()
-        except OSError, e:
+        except OSError as e:
             return((e.errno, e.strerror))	 # ERROR (return a tuple)
 
         if pid == 0:	   # The first child.
             os.setsid()
             try:
                 pid = os.fork()
-            except OSError, e:
+            except OSError as e:
                 return((e.errno, e.strerror))  # ERROR (return a tuple)
 
             if (pid == 0):	  # The second child.
