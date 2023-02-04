@@ -37,6 +37,9 @@ Parameters in General section :
     Default value : False
  - RunAsDaemon : Fork twice if True
     Default value : True
+ - Debug
+    Don't close stdout and stderr, to catch Python tracebacks
+    Default value : False
 
 Parameters in hostname section :
  - AWSAccessKeyId
@@ -81,10 +84,11 @@ Copyright transferred to Free Software Foundation, Inc.
 import os
 import sys
 import signal
-import urllib
+import urllib.request
 import socket
 import syslog
 import argparse
+import traceback
 from time import sleep
 from datetime import datetime
 from configparser import ConfigParser
@@ -114,6 +118,7 @@ defaults = {
     'PublicIPSource': 'http://ip.42.pl/raw',
     'UseDNS': 'False',
     'RunAsDaemon': 'True',
+    'Debug': 'False',
     }
 
 
@@ -166,7 +171,7 @@ class Config():
     configAttributes = [
         'AWSAccessKeyId', 'AWSSecretAccessKey', 'Delay', 'LogType',
         'LogDestination', 'PIDFile', 'PublicIPSource', 'UseDNS',
-        'RunAsDaemon',
+        'RunAsDaemon', 'Debug',
         ]
     hostAttributes = ['AWSAccessKeyId', 'AWSSecretAccessKey', 'UseDNS', ]
 
@@ -234,7 +239,7 @@ class Daemon(object):
 
             publicIP = self.getPublicIP()
 
-            if publicIP != '':
+            if publicIP:
                 change = 0
                 for host in self.config.hosts:
                     if publicIP != self.hosts[host]['IP']:
@@ -363,9 +368,19 @@ class Daemon(object):
              - http://checkip.dyndns.com (needs parsing)
         """
         try:
-            publicIP = urllib.urlopen(self.config.PublicIPSource).read()
-        except:
-            publicIP = ''
+            publicIPbytes = urllib.request.urlopen(self.config.PublicIPSource).read()
+            publicIP = publicIPbytes.decode()
+        except TimeoutError as timeout:
+            # When external network is unreachable, the request stops on timeout
+            publicIP = None
+        except Exception as e:
+            # Other exceptions are unexpected
+            self.log.log('Exception in getPublicIP')
+            if self.config.Debug == 'True':print('Exception in getPublicIP')
+            for line in ''.join(traceback.format_exception(e)).splitlines():
+                self.log.log(line)
+                if self.config.Debug == 'True':print(line)
+            publicIP = None
         return publicIP
 
     def updateIP(self, publicIP):
@@ -426,16 +441,18 @@ class Daemon(object):
         except (AttributeError, ValueError):
             maxfd = 256	   # default maximum
 
-        for fd in range(0, maxfd):
-            try:
-                os.close(fd)
-            except OSError:   # ERROR (ignore)
-                pass
+        if self.config.Debug != 'True':
+            for fd in range(0, maxfd):
+                try:
+                    os.close(fd)
+                except OSError:   # ERROR (ignore)
+                    pass
 
-        # Redirect the standard file descriptors to /dev/null.
-        os.open("/dev/null", os.O_RDONLY)   # standard input (0)
-        os.open("/dev/null", os.O_RDWR)     # standard output (1)
-        os.open("/dev/null", os.O_RDWR)     # standard error (2)
+            # Redirect the standard file descriptors to /dev/null.
+            os.open("/dev/null", os.O_RDONLY)   # standard input (0)
+            os.open("/dev/null", os.O_RDWR)     # standard output (1)
+            os.open("/dev/null", os.O_RDWR)     # standard error (2)
+
         return True
 
 

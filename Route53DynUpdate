@@ -1,7 +1,10 @@
 #!/sbin/openrc-run
 
+# Catch script Output when in Debug mode
+CatchOutput=False
+
 depend() {
-	need net
+    need net
 }
 
 checkconfig() {
@@ -9,14 +12,24 @@ checkconfig() {
     if [ ! -f /etc/network/Route53DynUpdate.ini ]; then
         eerror "Route53DynUpdate Configuration file /etc/network/Route53DynUpdate.ini doesn't exist"
         return 1
+    else
+        if grep "Debug=True" /etc/network/Route53DynUpdate.ini &> /dev/null
+        then
+            CatchOutput=True
+        fi
     fi
 }
 
 start() {
-	checkconfig || return 1
-	ebegin "Starting Route53DynUpdate"
-    /opt/bin/Route53DynUpdate.py
-	eend $?
+    checkconfig || return 1
+    ebegin "Starting Route53DynUpdate"
+    if [ $CatchOutput = True ]
+    then
+        /opt/bin/Route53DynUpdate.py > /var/log/Route53DynUpdate.stdout.log 2> /var/log/Route53DynUpdate.stderr.log
+    else
+        /opt/bin/Route53DynUpdate.py
+    fi
+    eend $?
 }
 
 stop() {
@@ -30,10 +43,10 @@ stop() {
     if ! kill $PID > /dev/null 2>&1; then
         einfo "Could not send SIGTERM to process $PID" >&2
     fi
-	eend $?
+    eend $?
 }
 
 restart() {
-	stop
-	start
+    stop
+    start
 }
